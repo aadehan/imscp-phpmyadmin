@@ -147,29 +147,37 @@ sub uninstall
 
     local $@;
     eval {
-        $self->{'dbh'}->do(
-            "DROP DATABASE IF EXISTS `@{ [ $::imscpConfig{'DATABASE_NAME'} . '_pma' ] }`"
-        );
+        $self->{'dbh'}->do("DROP DATABASE IF EXISTS `@{ [ $::imscpConfig{'DATABASE_NAME'} . '_pma' ] }`");
 
-        my ( $controlUser ) = @{ $self->{'dbh'}->selectcol_arrayref(
-            "SELECT `value` FROM `config` WHERE `name` = 'PMA_CONTROL_USER'"
-        ) };
+		my $controlUser;
+        unless(exists $::imscpConfig{'SERVER_ID'}){
+            ( $controlUser ) = @{ $self->{'dbh'}->selectcol_arrayref(
+            	"SELECT `value` FROM `config` WHERE `name` = 'PMA_CONTROL_USER'"
+            ) };
+        } else {
+        	( $controlUser ) = @{ $self->{'dbh'}->selectcol_arrayref(
+                "SELECT `value` FROM `config` WHERE server_id=? AND `name` = 'PMA_CONTROL_USER'",
+                undef, $::imscpConfig{'SERVER_ID'}
+            ) };
+        }
 
         if ( defined $controlUser ) {
-            $controlUser = decryptRijndaelCBC(
-                $::imscpDBKey, $::imscpDBiv, $controlUser
-            );
+            $controlUser = decryptRijndaelCBC($::imscpDBKey, $::imscpDBiv, $controlUser);
 
-            for my $host (
-                $::imscpOldConfig{'DATABASE_USER_HOST'},
-                $::imscpConfig{'DATABASE_USER_HOST'}
-            ) {
+            for my $host ($::imscpOldConfig{'DATABASE_USER_HOST'}, $::imscpConfig{'DATABASE_USER_HOST'}) {
                 next unless length $host;
                 Servers::sqld->factory()->dropUser( $controlUser, $host );
             }
         }
 
-        $self->{'dbh'}->do( "DELETE FROM `config` WHERE `name` LIKE 'PMA_%'" );
+		unless(exists $::imscpConfig{'SERVER_ID'}){
+        	$self->{'dbh'}->do("DELETE FROM `config` WHERE AND `name` LIKE 'PMA_%'");
+        } else {
+            $self->{'dbh'}->do( 
+            	"DELETE FROM `config` WHERE `server_id`=? AND `name` LIKE 'PMA_%'",
+            	undef, $::imscpConfig{'SERVER_ID'}
+            );
+        }
     };
     if ( $@ ) {
         error( $@ );
@@ -257,10 +265,17 @@ sub _buildConfigFiles
     local $@;
     my $rs = eval {
         # Main configuration file
-        my %config = @{ $self->{'dbh'}->selectcol_arrayref(
-            "SELECT `name`, `value` FROM `config` WHERE `name` LIKE 'PMA_%'",
-            { Columns => [ 1, 2 ] }
-        ) };
+        my %config;
+        if(exists $::imscpConfig{'SERVER_ID'}){
+            %config = @{ $self->{'dbh'}->selectcol_arrayref(
+                "SELECT `name`, `value` FROM `config` WHERE server_id=? AND `name` LIKE 'PMA_%'",
+                { Columns => [ 1, 2 ] }, $::imscpConfig{'SERVER_ID'}
+            ) };
+        } else {
+        	%config = @{ $self->{'dbh'}->selectcol_arrayref(
+                "SELECT `name`, `value` FROM `config` WHERE `name` LIKE 'PMA_%'", { Columns => [ 1, 2 ] }
+            ) };
+        }
 
         ( $config{'PMA_BLOWFISH_SECRET'} = decryptRijndaelCBC(
             $::imscpDBKey, $::imscpDBiv, $config{'PMA_BLOWFISH_SECRET'} // ''
@@ -284,26 +299,30 @@ sub _buildConfigFiles
         );
 
         # Save generated values in database (encrypted)
-        $self->{'dbh'}->do(
-            '
-                INSERT INTO `config` (`name`,`value`)
-                VALUES (?,?),(?,?),(?,?)
-                ON DUPLICATE KEY UPDATE `name` = `name`
-            ',
-            undef,
-            'PMA_BLOWFISH_SECRET',
-            encryptRijndaelCBC(
-                $::imscpDBKey, $::imscpDBiv, $config{'PMA_BLOWFISH_SECRET'}
-            ),
-            'PMA_CONTROL_USER',
-            encryptRijndaelCBC(
-                $::imscpDBKey, $::imscpDBiv, $config{'PMA_CONTROL_USER'}
-            ),
-            'PMA_CONTROL_USER_PASSWD',
-            encryptRijndaelCBC(
-                $::imscpDBKey, $::imscpDBiv, $config{'PMA_CONTROL_USER_PASSWD'}
-            )
+        my ($encSecret, $encUser, $encPasswd) = (
+        	encryptRijndaelCBC($::imscpDBKey, $::imscpDBiv, $config{'PMA_BLOWFISH_SECRET'}),            
+            encryptRijndaelCBC($::imscpDBKey, $::imscpDBiv, $config{'PMA_CONTROL_USER'}),            
+            encryptRijndaelCBC($::imscpDBKey, $::imscpDBiv, $config{'PMA_CONTROL_USER_PASSWD'})
         );
+        unless(exists $::imscpConfig{'SERVER_ID'}){
+            $self->{'dbh'}->do(
+                'INSERT INTO `config` (`name`,`value`) VALUES (?,?),(?,?),(?,?) 
+                ON DUPLICATE KEY UPDATE `name` = `name`',
+                undef, 
+                'PMA_BLOWFISH_SECRET', $encSecret, 
+                'PMA_CONTROL_USER', 	$encUser, 
+                'PMA_CONTROL_USER_PASSWD', $encPasswd
+            );
+        } else {
+        	$self->{'dbh'}->do(
+                'INSERT INTO `config` (`server_id`, `name`,`value`) VALUES (?,?,?),(?,?,?),(?,?,?) 
+                ON DUPLICATE KEY UPDATE `name` = `name`',
+                undef,
+                $::imscpConfig{'SERVER_ID'}, 'PMA_BLOWFISH_SECRET', $encSecret,
+                $::imscpConfig{'SERVER_ID'}, 'PMA_CONTROL_USER', 	$encUser,
+                $::imscpConfig{'SERVER_ID'}, 'PMA_CONTROL_USER_PASSWD', $encPasswd
+            );
+        }
 
         my $data = {
             BLOWFISH_SECRET   => $config{'PMA_BLOWFISH_SECRET'},
